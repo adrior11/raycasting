@@ -8,7 +8,7 @@ LDFLAGS := $(shell sdl2-config --libs)
 # Your source and target executable
 SRC     := main.c
 OBJ     := $(SRC:.c=.o)
-TARGET  := sdl_app
+TARGET  := raycasting
 
 .PHONY: all clean run
 

@@ -1,3 +1,42 @@
+# Object files
 *.o
-sdl_app*
+*.lo
+*.la
+*.al
+*.lai
+
+# Static & shared libraries
+*.a
+*.so
+*.dylib
+
+# Executables
+raycasting
+a.out
+*.exe
+
+# Dependency files
+*.d
+*.gcno
+*.gcda
+
+# Build directories (if you ever out-of-source)
+build/
+bin/
+obj/
+
+# Tool-generated files
+compile_commands.json
+tags
+cscope.*
+
+# Editor/project files
+*.swp
+*~
+.vscode/
+.idea/
 .cache/
+.DS_Store
+
+# Logs and temp files
+*.log

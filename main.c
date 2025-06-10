@@ -5,24 +5,44 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define SGN(x) ((x) > 0 ? 1 : ((x) < 0 ? -1 : 0))
-#define MAX(a, b) ((a) > (b) ? (a) : (b))
-#define MIN(a, b) ((a) < (b) ? (a) : (b))
-#define CLAMP(v, lo, hi) ((v) < (lo) ? (lo) : ((v) > (hi) ? (hi) : (v)))
-
 #define SCREEN_WIDTH 800
 #define SCREEN_HEIGHT 600
 #define STRIDE SCREEN_WIDTH * 4
 #define CAMERA_RADIUS 0.1f
-#define WALL_DIM_FACTOR 0xC0
+#define FOV_FACTOR 0.66f
 #define MAP_FILE "map.txt"
-#define MAP_MAX 1024
+#define MAP_MAX_STEPS 1024
+#define WALL_DIM_FACTOR 0xC0u
+#define SKY_COLOR 0xFF202020u
+#define GROUND_COLOR 0xFF505050u
 
-static const float BASE_MOVE_SPEED = 3.0f * 0.016;
-static const float BASE_ROTATION_SPEED = 3.0f * 0.016;
+static const float MOVE_SPEED_SEC = 5.0f;
+static const float ROT_SPEED_SEC = 5.0f;
 
-static const unsigned int COLORS[] = {0x00000000, 0xFF0000FF, 0xFF00FF00,
-                                      0xFFFF0000, 0xFFFF00FF};
+static inline int sgnf(float x) { return (x > 0) - (x < 0); }
+static inline int maxi(int a, int b) { return a > b ? a : b; }
+static inline int mini(int a, int b) { return a < b ? a : b; }
+static inline float clampf(float v, float lo, float hi) {
+  return (v < lo) ? lo : (v > hi ? hi : v);
+}
+static inline float inv_abs(float v) { return 1.0f / (fabsf(v) + 1e-20f); }
+
+typedef enum {
+  TILE_EMPTY = 0,
+  TILE_BLUE,
+  TILE_GREEN,
+  TILE_RED,
+  TILE_MAGENTA,
+  TILE_MAX
+} TileType;
+
+static const unsigned int COLORS[TILE_MAX] = {
+    0x00000000, /* empty   */
+    0xFF0000FF, /* blue    */
+    0xFF00FF00, /* green   */
+    0xFFFF0000, /* red     */
+    0xFFFF00FF  /* magenta */
+};
 
 struct Map {
   size_t width;
@@ -30,48 +50,9 @@ struct Map {
   int *tiles;
 };
 
-typedef struct {
-  float pos_x, pos_y;
-  float dir_x, dir_y;
-  float plane_x, plane_y;
-} Camera;
-
-static inline float inv_abs(float val) {
-  if (fabsf(val) < 1e-20f) {
-    return INFINITY;
-  }
-  return 1.0f / fabsf(val);
-}
-
-unsigned int dim_color(unsigned int color, unsigned int factor) {
-  unsigned int br = ((color & 0xFF00FF) * factor) >> 8;
-  unsigned int g = ((color & 0x00FF00) * factor) >> 8;
-  return 0xFF000000 | (br & 0xFF00FF) | (g & 0x00FF00);
-}
-
-void clear_pixels(uint8_t *pixels) {
-  memset(pixels, 0, SCREEN_WIDTH * SCREEN_HEIGHT * 4);
-}
-
-float *generate_camera_lut() {
-  float *lut = (float *)malloc(SCREEN_WIDTH * sizeof(float));
-  if (!lut) {
-    return NULL; // Memory allocation failed
-  }
-  for (int i = 0; i < SCREEN_WIDTH; i++) {
-    lut[i] = (2.0f * i / SCREEN_WIDTH) - 1.0;
-  }
-  return lut;
-};
-
-/**
- * Loads a map from a file.
- * The file format is expected to be:
- * <width> <height>
- * <tile values for each row (space-separated)>
- */
-struct Map load_map(const char *filename) {
+static struct Map load_map(const char *filename) {
   struct Map map = {0, 0, NULL};
+
   FILE *file = fopen(filename, "r");
   if (!file) {
     fprintf(stderr, "Failed to open map file: %s\n", filename);
@@ -82,18 +63,28 @@ struct Map load_map(const char *filename) {
       map.height <= 0) {
     fprintf(stderr, "Invalid map dimensions in file: %s\n", filename);
     fclose(file);
-    return map; // Invalid dimensions
+    return map;
   }
 
-  map.tiles = (int *)malloc(map.width * map.height * sizeof(int));
+  map.tiles = calloc(map.width * map.height, sizeof *map.tiles);
   if (!map.tiles) {
     fclose(file);
-    return map; // Memory allocation failed
+    map.width = map.height = 0;
+    return map;
   }
 
-  for (int y = 0; y < map.height; y++) {
-    for (int x = 0; x < map.width; x++) {
-      fscanf(file, "%d", &map.tiles[y * map.width + x]);
+  for (size_t y = 0; y < map.height; y++) {
+    for (size_t x = 0; x < map.width; x++) {
+      int t;
+      if (fscanf(file, "%d", &t) != 1) {
+        fprintf(stderr, "Premature end of map data at (%zu, %zu)\n", x, y);
+        free(map.tiles);
+        map.tiles = NULL;
+        map.width = map.height = 0;
+        fclose(file);
+        return map;
+      }
+      map.tiles[y * map.width + x] = t;
     }
   }
 
@@ -101,34 +92,42 @@ struct Map load_map(const char *filename) {
   return map;
 }
 
-int get_tile(struct Map map, int x, int y) {
-  if (x < 0 || x >= map.width || y < 0 || y >= map.height) {
+static inline int get_tile(const struct Map *map, int x, int y) {
+  if (!map->tiles)
     return -1;
-  }
-  return map.tiles[y * map.width + x];
+  if (x < 0 || y < 0)
+    return -1;
+  if ((size_t)x >= map->width || (size_t)y >= map->height)
+    return -1;
+  return map->tiles[y * map->width + x];
 }
 
-void rotate_camera(Camera *camera, float rad) {
+typedef struct {
+  float pos_x, pos_y;
+  float dir_x, dir_y;
+  float plane_x, plane_y;
+} Camera;
+
+static void rotate_camera(Camera *camera, float rad) {
   float cos_rad = cosf(rad);
   float sin_rad = sinf(rad);
 
   float new_dir_x = camera->dir_x * cos_rad - camera->dir_y * sin_rad;
   float new_dir_y = camera->dir_x * sin_rad + camera->dir_y * cos_rad;
-  camera->dir_x = new_dir_x;
-  camera->dir_y = new_dir_y;
-
   float new_plane_x = camera->plane_x * cos_rad - camera->plane_y * sin_rad;
   float new_plane_y = camera->plane_x * sin_rad + camera->plane_y * cos_rad;
+
+  camera->dir_x = new_dir_x;
+  camera->dir_y = new_dir_y;
   camera->plane_x = new_plane_x;
   camera->plane_y = new_plane_y;
 }
 
-void move_camera(Camera *camera, struct Map *map, float move_dir_x,
-                 float move_dir_y, float move_speed) {
+static void move_camera(Camera *camera, struct Map *map, float move_dir_x,
+                        float move_dir_y, float move_speed) {
   float new_x = camera->pos_x + move_dir_x * move_speed;
   float new_y = camera->pos_y + move_dir_y * move_speed;
 
-  // tiles that lie within 1 unit of the tentative center
   int min_tx = (int)fmaxf(floorf(new_x - 1.0f), 0.0f);
   int max_tx = (int)fminf(ceilf(new_x + 1.0f), (float)map->width - 1.0f);
   int min_ty = (int)fmaxf(floorf(new_y - 1.0f), 0.0f);
@@ -136,19 +135,17 @@ void move_camera(Camera *camera, struct Map *map, float move_dir_x,
 
   for (int ty = min_ty; ty <= max_ty; ty++) {
     for (int tx = min_tx; tx <= max_tx; tx++) {
-      if (get_tile(*map, tx, ty) == 0)
-        continue; // Empty tile – skip
+      if (get_tile(map, tx, ty) == TILE_EMPTY)
+        continue;
 
       const float tile_l = (float)tx;
       const float tile_r = tile_l + 1.0f;
       const float tile_t = (float)ty;
       const float tile_b = tile_t + 1.0f;
 
-      // closest point in the tile's AABB
-      const float closest_x = CLAMP(new_x, tile_l, tile_r);
-      const float closest_y = CLAMP(new_y, tile_t, tile_b);
+      const float closest_x = clampf(new_x, tile_l, tile_r);
+      const float closest_y = clampf(new_y, tile_t, tile_b);
 
-      // vector from that point to circle centre
       float dx = new_x - closest_x;
       float dy = new_y - closest_y;
       float dist_sq = dx * dx + dy * dy;
@@ -156,14 +153,9 @@ void move_camera(Camera *camera, struct Map *map, float move_dir_x,
       if (dist_sq < CAMERA_RADIUS * CAMERA_RADIUS) {
         float dist = sqrtf(dist_sq);
         if (dist > 0.0f) {
-          // penetration depth and normal
           float penetration = CAMERA_RADIUS - dist;
-          dx /= dist;
-          dy /= dist;
-
-          // Push the centre out of the wall
-          new_x += dx * penetration;
-          new_y += dy * penetration;
+          new_x += dx / dist * penetration;
+          new_y += dy / dist * penetration;
         }
       }
     }
@@ -173,41 +165,59 @@ void move_camera(Camera *camera, struct Map *map, float move_dir_x,
   camera->pos_y = new_y;
 }
 
-void vertical_line(uint8_t *pixels, int x, int y_start, int y_end,
-                   unsigned int color) {
-  // Decompose the color (0xAARRGGBB) into separate bytes
+static inline unsigned int dim_color(unsigned int color, unsigned int factor) {
+  unsigned int br = ((color & 0xFF00FFu) * factor) >> 8;
+  unsigned int g = ((color & 0x00FF00u) * factor) >> 8;
+  return 0xFF000000 | (br & 0xFF00FFu) | (g & 0x00FF00u);
+}
+
+static void clear_pixels(uint8_t *pixels) {
+  memset(pixels, 0, SCREEN_HEIGHT * STRIDE);
+}
+
+static float *generate_camera_lut() {
+  float *lut = (float *)malloc(SCREEN_WIDTH * sizeof(float));
+  if (!lut)
+    return NULL;
+
+  for (int i = 0; i < SCREEN_WIDTH; i++)
+    lut[i] = (2.0f * i / SCREEN_WIDTH) - 1.0f;
+
+  return lut;
+}
+
+static void vertical_line(uint8_t *pixels, int x, int y0, int y1,
+                          unsigned int color) {
   unsigned int a = (color >> 24) & 0xFF;
   unsigned int r = (color >> 16) & 0xFF;
   unsigned int g = (color >> 8) & 0xFF;
   unsigned int b = color & 0xFF;
 
-  y_start = MAX(0, y_start);
-  y_end = MIN(SCREEN_HEIGHT - 1, y_end);
+  y0 = maxi(0, y0);
+  y1 = mini(SCREEN_HEIGHT - 1, y1);
 
-  // Convert pixel index to a byte offset in the buffer:
-  // each pixel is represented by 4 bytes (ARGB)
-  unsigned int offset = (y_start * SCREEN_WIDTH + x) * 4;
+  unsigned int offset = (y0 * SCREEN_WIDTH + x) * 4;
 
-  for (int y = y_start; y <= y_end; y++) {
-    pixels[offset] = r;
-    pixels[offset + 1] = g;
-    pixels[offset + 2] = b;
-    pixels[offset + 3] = a;
-
-    offset += STRIDE; // Move to the next pixel
+  uint8_t *row = pixels + (size_t)y0 * STRIDE + x * 4;
+  for (int y = y0; y <= y1; y++) {
+    row[0] = b;
+    row[1] = g;
+    row[2] = r;
+    row[3] = a;
+    row += STRIDE;
   }
 }
 
-void render_raycast(float *camera_lut, uint8_t *restrict pixels, Camera camera,
-                    struct Map map) {
+static void render_raycast(float *camera_lut, uint8_t *pixels, Camera *camera,
+                           const struct Map *map) {
   for (int x = 0; x < SCREEN_WIDTH; x++) {
     float camera_x = camera_lut[x];
 
-    float ray_dir_x = camera.dir_x + camera.plane_x * camera_x;
-    float ray_dir_y = camera.dir_y + camera.plane_y * camera_x;
+    float ray_dir_x = camera->dir_x + camera->plane_x * camera_x;
+    float ray_dir_y = camera->dir_y + camera->plane_y * camera_x;
 
-    float ray_pos_x = camera.pos_x;
-    float ray_pos_y = camera.pos_y;
+    float ray_pos_x = camera->pos_x;
+    float ray_pos_y = camera->pos_y;
 
     int ipos_x = (int)ray_pos_x;
     int ipos_y = (int)ray_pos_y;
@@ -215,8 +225,8 @@ void render_raycast(float *camera_lut, uint8_t *restrict pixels, Camera camera,
     float delta_dist_x = inv_abs(ray_dir_x);
     float delta_dist_y = inv_abs(ray_dir_y);
 
-    int step_x = SGN(ray_dir_x);
-    int step_y = SGN(ray_dir_y);
+    int step_x = sgnf(ray_dir_x);
+    int step_y = sgnf(ray_dir_y);
 
     float side_dist_x = (ray_dir_x < 0)
                             ? (ray_pos_x - ipos_x) * delta_dist_x
@@ -225,18 +235,11 @@ void render_raycast(float *camera_lut, uint8_t *restrict pixels, Camera camera,
                             ? (ray_pos_y - ipos_y) * delta_dist_y
                             : (ipos_y + 1.0f - ray_pos_y) * delta_dist_y;
 
-    int hit_val = 0;
+    int hit_val = TILE_EMPTY;
     int hit_side = 0;
     int steps = 0;
 
-    // Perform DDA
-    while (hit_val == 0) {
-      if (steps >= MAP_MAX) {
-        fprintf(stderr, "Raycast exceeded maximum steps at (%d, %d)\n", ipos_x,
-                ipos_y);
-        break;
-      }
-
+    while (hit_val == TILE_EMPTY && steps < MAP_MAX_STEPS) {
       if (side_dist_x < side_dist_y) {
         side_dist_x += delta_dist_x;
         ipos_x += step_x;
@@ -248,164 +251,169 @@ void render_raycast(float *camera_lut, uint8_t *restrict pixels, Camera camera,
       }
 
       hit_val = get_tile(map, ipos_x, ipos_y);
-      if (hit_val == -1) {
-        // TODO: error handling
-        fprintf(stderr, "Raycast hit out of bounds at (%d, %d)\n", ipos_x,
-                ipos_y);
-      }
+      if (hit_val == -1)
+        break;
 
       steps++;
     }
 
-    unsigned int color = COLORS[hit_val]; // NOTE: could fail
+    if (hit_val < 0 || hit_val >= TILE_MAX)
+      hit_val = TILE_EMPTY;
 
-    if (hit_side == 1) {
+    unsigned int color = COLORS[hit_val];
+    if (hit_side)
       color = dim_color(color, WALL_DIM_FACTOR);
-    }
 
     float perp_wall_dist = (hit_side == 0) ? side_dist_x - delta_dist_x
                                            : side_dist_y - delta_dist_y;
-    int line_height = (int)(SCREEN_HEIGHT / perp_wall_dist);
-    int draw_start = MAX(0, (SCREEN_HEIGHT / 2) - (line_height / 2));
-    int draw_end =
-        MIN(SCREEN_HEIGHT - 1, (SCREEN_HEIGHT / 2) + (line_height / 2));
+    if (perp_wall_dist < 1e-6f)
+      perp_wall_dist = 1e-6f;
 
-    vertical_line(pixels, x, 0, draw_start, 0xFF202020);
-    vertical_line(pixels, x, draw_end, SCREEN_HEIGHT, 0xFF505050);
+    int line_height = (int)(SCREEN_HEIGHT / perp_wall_dist);
+    int draw_start = maxi(0, (SCREEN_HEIGHT - line_height) / 2);
+    int draw_end = mini(SCREEN_HEIGHT - 1, (SCREEN_HEIGHT + line_height) / 2);
+
+    vertical_line(pixels, x, 0, draw_start, SKY_COLOR);
+    vertical_line(pixels, x, draw_end, SCREEN_HEIGHT, GROUND_COLOR);
     vertical_line(pixels, x, draw_start, draw_end, color);
   }
 }
 
 int main(int argc, char *argv[]) {
-  SDL_Window *window = NULL;
-  SDL_Renderer *renderer = NULL;
-  SDL_Texture *texture = NULL;
-  uint8_t *pixels = NULL;
-  float *camera_lut = NULL;
 
   if (SDL_Init(SDL_INIT_VIDEO) != 0) {
     fprintf(stderr, "SDL_Init Error: %s\n", SDL_GetError());
     return 1;
   }
 
-  window = SDL_CreateWindow("Test", SDL_WINDOWPOS_CENTERED_DISPLAY(0),
-                            SDL_WINDOWPOS_CENTERED_DISPLAY(0), SCREEN_WIDTH,
-                            SCREEN_HEIGHT, 0);
+  SDL_Window *window = SDL_CreateWindow(
+      "Raycasting Demo", SDL_WINDOWPOS_CENTERED_DISPLAY(0),
+      SDL_WINDOWPOS_CENTERED_DISPLAY(0), SCREEN_WIDTH, SCREEN_HEIGHT, 0);
   if (!window) {
     fprintf(stderr, "SDL_CreateWindow Error: %s\n", SDL_GetError());
     SDL_Quit();
-    return 1;
+    return EXIT_FAILURE;
   }
 
-  renderer = SDL_CreateRenderer(
+  SDL_Renderer *renderer = SDL_CreateRenderer(
       window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
   if (!renderer) {
     fprintf(stderr, "SDL_CreateRenderer Error: %s\n", SDL_GetError());
-    goto failed_startup;
+    SDL_DestroyWindow(window);
+    SDL_Quit();
+    return EXIT_FAILURE;
   }
 
-  texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888,
-                              SDL_TEXTUREACCESS_STREAMING, SCREEN_WIDTH,
-                              SCREEN_HEIGHT);
+  SDL_Texture *texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888,
+                                           SDL_TEXTUREACCESS_STREAMING,
+                                           SCREEN_WIDTH, SCREEN_HEIGHT);
   if (!texture) {
     fprintf(stderr, "SDL_CreateTexture Error: %s\n", SDL_GetError());
-    goto failed_startup;
+    SDL_DestroyRenderer(renderer);
+    SDL_DestroyWindow(window);
+    SDL_Quit();
+    return EXIT_FAILURE;
   }
 
-  pixels = malloc(SCREEN_WIDTH * SCREEN_HEIGHT * 4);
+  uint8_t *pixels = malloc(SCREEN_WIDTH * SCREEN_HEIGHT * 4);
   if (!pixels) {
     fprintf(stderr, "Memory allocation failed for pixels\n");
-    goto failed_startup;
+    SDL_DestroyTexture(texture);
+    SDL_DestroyRenderer(renderer);
+    SDL_DestroyWindow(window);
+    SDL_Quit();
+    return EXIT_FAILURE;
   }
 
-  camera_lut = generate_camera_lut();
+  float *camera_lut = generate_camera_lut();
   if (!camera_lut) {
     fprintf(stderr, "Memory allocation failed for camera LUT\n");
-    goto failed_startup;
+    free(pixels);
+    SDL_DestroyTexture(texture);
+    SDL_DestroyRenderer(renderer);
+    SDL_DestroyWindow(window);
+    SDL_Quit();
+    return EXIT_FAILURE;
   }
 
   struct Map map = load_map(MAP_FILE);
   if (!map.tiles) {
     fprintf(stderr, "Memory allocation failed for map tiles\n");
-    goto failed_startup;
+    free(camera_lut);
+    free(pixels);
+    SDL_DestroyTexture(texture);
+    SDL_DestroyRenderer(renderer);
+    SDL_DestroyWindow(window);
+    SDL_Quit();
+    return EXIT_FAILURE;
   }
 
-  float dir_x = -1.0f;
-  float dir_y = 0.1f;
-  float normalized_length = sqrtf(dir_x * dir_x + dir_y * dir_y);
   Camera camera = {
       .pos_x = 2.0f,
       .pos_y = 2.0f,
-      .dir_x = dir_x / normalized_length,
-      .dir_y = dir_y / normalized_length,
+      .dir_x = -1.0f,
+      .dir_y = 0.0f,
       .plane_x = 0.0f,
-      .plane_y = 0.66f,
+      .plane_y = FOV_FACTOR,
   };
 
-  SDL_Event e;
+  float len = sqrtf(camera.dir_x * camera.dir_x + camera.dir_y * camera.dir_y);
+  if (len > 0.f) {
+    camera.dir_x /= len;
+    camera.dir_y /= len;
+  }
+
+  Uint64 freq = SDL_GetPerformanceFrequency();
+  Uint64 last = SDL_GetPerformanceCounter();
+
   int running = 1;
+  SDL_Event e;
+
   while (running) {
     while (SDL_PollEvent(&e)) {
       if (e.type == SDL_QUIT) {
         running = 0;
-        break;
       }
     }
 
+    Uint64 now = SDL_GetPerformanceCounter();
+    float dt = (float)(now - last) / (float)freq;
+    last = now;
+    float move_speed = MOVE_SPEED_SEC * dt;
+    float rot_speed = ROT_SPEED_SEC * dt;
+
     const Uint8 *kb = SDL_GetKeyboardState(NULL);
-
-    if (kb[SDL_SCANCODE_ESCAPE]) {
-      running = 0;
-      continue;
-    }
-
+    if (kb[SDL_SCANCODE_ESCAPE])
+      break;
     if (kb[SDL_SCANCODE_LEFT])
-      rotate_camera(&camera, BASE_ROTATION_SPEED);
+      rotate_camera(&camera, rot_speed);
     if (kb[SDL_SCANCODE_RIGHT])
-      rotate_camera(&camera, -BASE_ROTATION_SPEED);
+      rotate_camera(&camera, -rot_speed);
     if (kb[SDL_SCANCODE_W])
-      move_camera(&camera, &map, camera.dir_x, camera.dir_y, BASE_MOVE_SPEED);
+      move_camera(&camera, &map, camera.dir_x, camera.dir_y, move_speed);
     if (kb[SDL_SCANCODE_S])
-      move_camera(&camera, &map, camera.dir_x, camera.dir_y, -BASE_MOVE_SPEED);
+      move_camera(&camera, &map, camera.dir_x, camera.dir_y, -move_speed);
     if (kb[SDL_SCANCODE_A])
-      move_camera(&camera, &map, camera.dir_y, -camera.dir_x, -BASE_MOVE_SPEED);
+      move_camera(&camera, &map, camera.dir_y, -camera.dir_x, -move_speed);
     if (kb[SDL_SCANCODE_D])
-      move_camera(&camera, &map, camera.dir_y, -camera.dir_x, BASE_MOVE_SPEED);
+      move_camera(&camera, &map, camera.dir_y, -camera.dir_x, move_speed);
 
     clear_pixels(pixels);
 
-    render_raycast(camera_lut, pixels, camera, map);
+    render_raycast(camera_lut, pixels, &camera, &map);
 
-    SDL_UpdateTexture(texture, NULL, pixels, SCREEN_WIDTH * 4);
+    SDL_UpdateTexture(texture, NULL, pixels, STRIDE);
     SDL_RenderClear(renderer);
     SDL_RenderCopy(renderer, texture, NULL, NULL);
     SDL_RenderPresent(renderer);
   }
 
+  free(map.tiles);
+  free(camera_lut);
+  free(pixels);
   SDL_DestroyRenderer(renderer);
   SDL_DestroyTexture(texture);
   SDL_DestroyWindow(window);
   SDL_Quit();
-
-  free(pixels);
-  free(camera_lut);
-  free(map.tiles);
-
   return 0;
-
-failed_startup:
-  if (pixels)
-    free(pixels);
-  if (camera_lut)
-    free(camera_lut);
-  if (map.tiles)
-    free(map.tiles);
-  if (texture)
-    SDL_DestroyTexture(texture);
-  if (renderer)
-    SDL_DestroyRenderer(renderer);
-  if (window)
-    SDL_DestroyWindow(window);
-  SDL_Quit();
-  return 1;
 }
