@@ -1,6 +1,6 @@
 # raycasting
 
-![showcase](assets/showcase.png)
+![showcase](assets/Showcase.png)
 
 ## 💡 Overview
 This project is a quick showcase of the classic Wolfenstein 3D raycasting technique built in C.  
