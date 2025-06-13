@@ -15,6 +15,7 @@
 #define WALL_DIM_FACTOR 0xC0u
 #define SKY_COLOR 0xFF202020u
 #define GROUND_COLOR 0xFF505050u
+#define FOG_FACTOR 0.03f
 
 static const float MOVE_SPEED_SEC = 5.0f;
 static const float ROT_SPEED_SEC = 5.0f;
@@ -171,6 +172,21 @@ static inline unsigned int dim_color(unsigned int color, unsigned int factor) {
   return 0xFF000000 | (br & 0xFF00FFu) | (g & 0x00FF00u);
 }
 
+static inline unsigned int distance_fog(unsigned int color, float dist,
+                                        float fog_factor) {
+  if (dist < 0.0f || fog_factor <= 0.0f)
+    return color;
+  float factor = 1.0f / (1.0f + dist * fog_factor);
+  unsigned int a = (color >> 24) & 0xFF;
+  unsigned int r = (color >> 16) & 0xFF;
+  unsigned int g = (color >> 8) & 0xFF;
+  unsigned int b = color & 0xFF;
+  r = (unsigned int)(r * factor);
+  g = (unsigned int)(g * factor);
+  b = (unsigned int)(b * factor);
+  return (a << 24) | (r << 16) | (g << 8) | b;
+}
+
 static void clear_pixels(uint8_t *pixels) {
   memset(pixels, 0, SCREEN_HEIGHT * STRIDE);
 }
@@ -264,6 +280,8 @@ static void render_raycast(float *camera_lut, uint8_t *pixels, Camera *camera,
     if (hit_side)
       color = dim_color(color, WALL_DIM_FACTOR);
 
+    unsigned int fog_color = distance_fog(color, steps, FOG_FACTOR);
+
     float perp_wall_dist = (hit_side == 0) ? side_dist_x - delta_dist_x
                                            : side_dist_y - delta_dist_y;
     if (perp_wall_dist < 1e-6f)
@@ -275,7 +293,7 @@ static void render_raycast(float *camera_lut, uint8_t *pixels, Camera *camera,
 
     vertical_line(pixels, x, 0, draw_start, SKY_COLOR);
     vertical_line(pixels, x, draw_end, SCREEN_HEIGHT, GROUND_COLOR);
-    vertical_line(pixels, x, draw_start, draw_end, color);
+    vertical_line(pixels, x, draw_start, draw_end, fog_color);
   }
 }
 
