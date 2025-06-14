@@ -1,4 +1,7 @@
+#include "SDL_pixels.h"
+#include "SDL_surface.h"
 #include <SDL.h>
+#include <SDL_image.h>
 #include <math.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -16,6 +19,12 @@
 #define SKY_COLOR 0xFF202020u
 #define GROUND_COLOR 0xFF505050u
 #define FOG_FACTOR 0.03f
+
+#define TEX_W 16
+#define TEX_H 16
+#define TEX_COUNT 4
+#define ATLAS_W (TEX_W * TEX_COUNT)
+#define ATLAS_H TEX_H
 
 static const float MOVE_SPEED_SEC = 5.0f;
 static const float ROT_SPEED_SEC = 5.0f;
@@ -36,14 +45,6 @@ typedef enum {
   TILE_MAGENTA,
   TILE_MAX
 } TileType;
-
-static const unsigned int COLORS[TILE_MAX] = {
-    0x00000000, /* empty   */
-    0xFF0000FF, /* blue    */
-    0xFF00FF00, /* green   */
-    0xFFFF0000, /* red     */
-    0xFFFF00FF  /* magenta */
-};
 
 struct Map {
   size_t width;
@@ -166,26 +167,54 @@ static void move_camera(Camera *camera, struct Map *map, float move_dir_x,
   camera->pos_y = new_y;
 }
 
+static uint32_t *atlas_pixels = NULL;
+static void load_atlas(const char *png) {
+  IMG_Init(IMG_INIT_PNG);
+
+  SDL_Surface *s = IMG_Load(png);
+  if (!s) {
+    fprintf(stderr, "Failed to load texture atlas: %s\n", IMG_GetError());
+    exit(EXIT_FAILURE);
+  }
+
+  if (s->format->format != SDL_PIXELFORMAT_ARGB8888) {
+    SDL_Surface *conv =
+        SDL_ConvertSurfaceFormat(s, SDL_PIXELFORMAT_ARGB8888, 0);
+    SDL_FreeSurface(s);
+    s = conv;
+  }
+
+  atlas_pixels = malloc(ATLAS_W * ATLAS_H * sizeof(uint32_t));
+  memcpy(atlas_pixels, s->pixels, ATLAS_W * ATLAS_H * sizeof(uint32_t));
+  SDL_FreeSurface(s);
+}
+
+static char *get_texture_path(const char *name) {
+  static char path[256];
+  snprintf(path, sizeof(path), "textures/%s.png", name);
+  return path;
+}
+
 static inline unsigned int dim_color(unsigned int color, unsigned int factor) {
   unsigned int br = ((color & 0xFF00FFu) * factor) >> 8;
   unsigned int g = ((color & 0x00FF00u) * factor) >> 8;
   return 0xFF000000 | (br & 0xFF00FFu) | (g & 0x00FF00u);
 }
 
-static inline unsigned int distance_fog(unsigned int color, float dist,
-                                        float fog_factor) {
-  if (dist < 0.0f || fog_factor <= 0.0f)
-    return color;
-  float factor = 1.0f / (1.0f + dist * fog_factor);
-  unsigned int a = (color >> 24) & 0xFF;
-  unsigned int r = (color >> 16) & 0xFF;
-  unsigned int g = (color >> 8) & 0xFF;
-  unsigned int b = color & 0xFF;
-  r = (unsigned int)(r * factor);
-  g = (unsigned int)(g * factor);
-  b = (unsigned int)(b * factor);
-  return (a << 24) | (r << 16) | (g << 8) | b;
-}
+// static inline unsigned int distance_fog(unsigned int color, float dist,
+//                                         float fog_factor) {
+//   if (dist < 0.0f || fog_factor <= 0.0f)
+//     return color;
+//   float factor = 1.0f / (1.0f + dist * fog_factor);
+//   unsigned int a = (color >> 24) & 0xFF;
+//   unsigned int r = (color >> 16) & 0xFF;
+//   unsigned int g = (color >> 8) & 0xFF;
+//   unsigned int b = color & 0xFF;
+//   r = (unsigned int)(r * factor);
+//   g = (unsigned int)(g * factor);
+//   b = (unsigned int)(b * factor);
+//   return (a << 24) | (r << 16) | (g << 8) | b;
+// }
 
 static void clear_pixels(uint8_t *pixels) {
   memset(pixels, 0, SCREEN_HEIGHT * STRIDE);
@@ -276,24 +305,52 @@ static void render_raycast(float *camera_lut, uint8_t *pixels, Camera *camera,
     if (hit_val < 0 || hit_val >= TILE_MAX)
       hit_val = TILE_EMPTY;
 
-    unsigned int color = COLORS[hit_val];
-    if (hit_side)
-      color = dim_color(color, WALL_DIM_FACTOR);
-
-    unsigned int fog_color = distance_fog(color, steps, FOG_FACTOR);
-
     float perp_wall_dist = (hit_side == 0) ? side_dist_x - delta_dist_x
                                            : side_dist_y - delta_dist_y;
     if (perp_wall_dist < 1e-6f)
       perp_wall_dist = 1e-6f;
 
+    int tex_id = maxi(0, hit_val - 1);
+
+    if (tex_id >= TEX_COUNT) {
+      fprintf(stderr, "Invalid texture ID: %d\n", tex_id);
+      tex_id = 0;
+    }
+
+    float wall_x = (hit_side == 0) ? (ray_pos_y + perp_wall_dist * ray_dir_y)
+                                   : (ray_pos_x + perp_wall_dist * ray_dir_x);
+    wall_x -= floorf(wall_x);
+
+    int tex_x = (int)(wall_x * TEX_W);
+    if ((hit_side == 0 && ray_dir_x > 0) || (hit_side == 1 && ray_dir_y < 0)) {
+      tex_x = TEX_W - tex_x - 1;
+    }
+
+    // Horizontal offset of this tile inside the 64-pixel atlas row
+    int atlas_x0 = tex_id * TEX_W;
+
     int line_height = (int)(SCREEN_HEIGHT / perp_wall_dist);
     int draw_start = maxi(0, (SCREEN_HEIGHT - line_height) / 2);
     int draw_end = mini(SCREEN_HEIGHT - 1, (SCREEN_HEIGHT + line_height) / 2);
 
+    for (int y = draw_start; y <= draw_end; y++) {
+      int d = y * 256 - SCREEN_HEIGHT * 128 + line_height * 128;
+      int tex_y = ((d * TEX_H) / line_height) / 256; // 0..15
+
+      uint32_t c = atlas_pixels[(tex_y * ATLAS_W) + atlas_x0 + tex_x];
+
+      if (hit_side)
+        c = dim_color(c, WALL_DIM_FACTOR);
+
+      uint8_t *p = pixels + (size_t)y * STRIDE + x * 4;
+      p[0] = c & 0xFF;         // B
+      p[1] = (c >> 8) & 0xFF;  // G
+      p[2] = (c >> 16) & 0xFF; // R
+      p[3] = 0xFF;             // A
+    }
+
     vertical_line(pixels, x, 0, draw_start, SKY_COLOR);
     vertical_line(pixels, x, draw_end, SCREEN_HEIGHT, GROUND_COLOR);
-    vertical_line(pixels, x, draw_start, draw_end, fog_color);
   }
 }
 
@@ -305,7 +362,7 @@ int main(int argc, char *argv[]) {
   }
 
   SDL_Window *window = SDL_CreateWindow(
-      "Raycasting Demo", SDL_WINDOWPOS_CENTERED_DISPLAY(0),
+      "Test", SDL_WINDOWPOS_CENTERED_DISPLAY(0),
       SDL_WINDOWPOS_CENTERED_DISPLAY(0), SCREEN_WIDTH, SCREEN_HEIGHT, 0);
   if (!window) {
     fprintf(stderr, "SDL_CreateWindow Error: %s\n", SDL_GetError());
@@ -365,6 +422,9 @@ int main(int argc, char *argv[]) {
     SDL_Quit();
     return EXIT_FAILURE;
   }
+
+  char *atlas_path = get_texture_path("atlas");
+  load_atlas(atlas_path);
 
   Camera camera = {
       .pos_x = 2.0f,
@@ -426,6 +486,7 @@ int main(int argc, char *argv[]) {
     SDL_RenderPresent(renderer);
   }
 
+  free(atlas_pixels);
   free(map.tiles);
   free(camera_lut);
   free(pixels);
