@@ -215,6 +215,14 @@ static inline int get_tile(const struct Map *map, int x, int y) {
   return map->tiles[y * map->width + x];
 }
 
+static int is_solid(const struct Map *map, int x, int y) {
+  unsigned id = get_tile(map, x, y);
+  if (id == (unsigned)-1)
+    return 1;
+  Tile *t = get_tile_by_id(id);
+  return t && t->type == TILE_TYPE_WALL;
+}
+
 typedef struct {
   float pos_x, pos_y;
   float dir_x, dir_y;
@@ -236,49 +244,44 @@ static void rotate_camera(Camera *camera, float rad) {
   camera->plane_y = new_plane_y;
 }
 
-static void move_camera(Camera *camera, struct Map *map, float move_dir_x,
-                        float move_dir_y, float move_speed) {
-  float new_x = camera->pos_x + move_dir_x * move_speed;
-  float new_y = camera->pos_y + move_dir_y * move_speed;
+#define MAX_STEP (CAMERA_RADIUS * 0.5f)
 
-  float r = CAMERA_RADIUS;
-  int min_tx = (int)floorf(new_x - r);
-  int max_tx = (int)ceilf(new_x + r);
-  int min_ty = (int)floorf(new_y - r);
-  int max_ty = (int)ceilf(new_y + r);
-
-  for (int ty = min_ty; ty <= max_ty; ty++) {
-    for (int tx = min_tx; tx <= max_tx; tx++) {
-      unsigned tile_id = get_tile(map, tx, ty);
-      Tile *t = get_tile_by_id(tile_id);
-      if (!t || t->type != TILE_TYPE_WALL)
-        continue;
-
-      const float tile_l = (float)tx;
-      const float tile_r = tile_l + 1.0f;
-      const float tile_t = (float)ty;
-      const float tile_b = tile_t + 1.0f;
-
-      const float closest_x = clampf(new_x, tile_l, tile_r);
-      const float closest_y = clampf(new_y, tile_t, tile_b);
-
-      float dx = new_x - closest_x;
-      float dy = new_y - closest_y;
-      float dist_sq = dx * dx + dy * dy;
-
-      if (dist_sq < r * r) {
-        float dist = sqrtf(dist_sq);
-        if (dist > 0.0f) {
-          float penetration = r - dist;
-          new_x += dx / dist * penetration;
-          new_y += dy / dist * penetration;
-        }
-      }
-    }
+static void move_camera(Camera *cam, const struct Map *map, float dir_x,
+                        float dir_y, float speed) {
+  float remaining = fabsf(speed);
+  if (speed < 0.0f) {
+    dir_x = -dir_x;
+    dir_y = -dir_y;
   }
 
-  camera->pos_x = new_x;
-  camera->pos_y = new_y;
+  // normalize direction vector
+  float len = hypotf(dir_x, dir_y);
+  if (len == 0.0f)
+    return;
+  dir_x /= len;
+  dir_y /= len;
+
+  // micro-step to avoid tunneling through walls
+  int max_iter = 64;
+  while (remaining > 1e-6f && max_iter--) {
+    float step = (remaining > MAX_STEP) ? MAX_STEP : remaining;
+    remaining -= step;
+
+    float nx = cam->pos_x + dir_x * step;
+    if (!is_solid(map, (int)floorf(nx + sgnf(dir_x) * CAMERA_RADIUS),
+                  (int)floorf(cam->pos_y)))
+      cam->pos_x = nx;
+
+    float ny = cam->pos_y + dir_y * step;
+    if (!is_solid(map, (int)floorf(cam->pos_x),
+                  (int)floorf(ny + sgnf(dir_y) * CAMERA_RADIUS)))
+      cam->pos_y = ny;
+  }
+
+#ifdef DEBUG
+  if (is_solid(map, (int)cam->pos_x, (int)cam->pos_y))
+    fprintf(stderr, "inside wall @ (%.2f, %.2f)\n", cam->pos_x, cam->pos_y);
+#endif
 }
 
 static inline unsigned int dim_color(unsigned int color, unsigned int factor) {
