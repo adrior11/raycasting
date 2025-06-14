@@ -1,7 +1,10 @@
+#include "SDL_blendmode.h"
 #include "SDL_pixels.h"
+#include "SDL_render.h"
 #include "SDL_surface.h"
 #include <SDL.h>
 #include <SDL_image.h>
+#include <SDL_ttf.h>
 #include <math.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -9,11 +12,15 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define DEBUG 1
+#define DEBUG 0
 
+#define FULLSCREEN_MODE 0
 #define SCREEN_WIDTH 1200
-#define SCREEN_HEIGHT 800
+#define SCREEN_HEIGHT 900
 #define STRIDE SCREEN_WIDTH * 4
+
+#define FONT_PATH "fonts/EightBit Atari-Bt.ttf"
+#define FONT_SIZE 18
 
 #define CAMERA_RADIUS 0.1f
 #define FOV_FACTOR 0.66f
@@ -29,7 +36,6 @@
 #define TILE_MANIFEST "tiles.txt"
 #define TILE_BASE_SIZE 128
 #define MAX_TILE_ID 0xFF
-
 #define CEILING_TILE_ID 0x41
 
 static const float MOVE_SPEED_SEC = 5.0f;
@@ -134,7 +140,7 @@ void load_tiles(const char *manifest_path) {
       id_lut[id] = t;
   }
 
-#ifdef DEBUG
+#if DEBUG
   if (idx != tile_count) {
     fprintf(stderr, "Warning: Expected %zu tiles, but loaded %zu\n", tile_count,
             idx);
@@ -204,7 +210,7 @@ static struct Map load_map(const char *filename) {
 
   fclose(file);
 
-#ifdef DEBUG
+#if DEBUG
   if (map.tiles == NULL)
     fprintf(stderr, "Failed to load map tiles from file: %s\n", filename);
 #endif
@@ -278,7 +284,7 @@ static void move_camera(Camera *cam, const struct Map *map, float dir_x,
       cam->pos_y = ny;
   }
 
-#ifdef DEBUG
+#if DEBUG
   if (is_solid(map, (int)cam->pos_x, (int)cam->pos_y))
     fprintf(stderr, "inside wall @ (%.2f, %.2f)\n", cam->pos_x, cam->pos_y);
 #endif
@@ -289,21 +295,6 @@ static inline unsigned int dim_color(unsigned int color, unsigned int factor) {
   unsigned int g = ((color & 0x00FF00u) * factor) >> 8;
   return 0xFF000000 | (br & 0xFF00FFu) | (g & 0x00FF00u);
 }
-
-// static inline unsigned int distance_fog(unsigned int color, float dist,
-//                                         float fog_factor) {
-//   if (dist < 0.0f || fog_factor <= 0.0f)
-//     return color;
-//   float factor = 1.0f / (1.0f + dist * fog_factor);
-//   unsigned int a = (color >> 24) & 0xFF;
-//   unsigned int r = (color >> 16) & 0xFF;
-//   unsigned int g = (color >> 8) & 0xFF;
-//   unsigned int b = color & 0xFF;
-//   r = (unsigned int)(r * factor);
-//   g = (unsigned int)(g * factor);
-//   b = (unsigned int)(b * factor);
-//   return (a << 24) | (r << 16) | (g << 8) | b;
-// }
 
 static void clear_pixels(uint8_t *pixels) {
   memset(pixels, 0, SCREEN_HEIGHT * STRIDE);
@@ -340,6 +331,39 @@ static void vertical_line(uint8_t *pixels, int x, int y0, int y1,
     row[3] = a;
     row += STRIDE;
   }
+}
+
+static void render_fps(SDL_Renderer *renderer, TTF_Font *font, float fps) {
+  char fps_text[64];
+  snprintf(fps_text, sizeof(fps_text), "FPS: %.1f", fps);
+
+  SDL_Color color = {255, 255, 255, 255};
+  SDL_Surface *surf = TTF_RenderText_Solid(font, fps_text, color);
+  if (!surf) {
+    fprintf(stderr, "TTF_RenderText_Solid Error: %s\n", TTF_GetError());
+    return;
+  }
+
+  SDL_Texture *tex = SDL_CreateTextureFromSurface(renderer, surf);
+  if (!tex) {
+    fprintf(stderr, "SDL_CreateTextureFromSurface Error: %s\n", SDL_GetError());
+    SDL_FreeSurface(surf);
+    return;
+  }
+
+  int w, h;
+  SDL_QueryTexture(tex, NULL, NULL, &w, &h);
+
+  SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+  SDL_SetRenderDrawColor(renderer, 0, 0, 0, 128);
+  SDL_Rect bg = {8, 8, w + 4, h + 4};
+  SDL_RenderFillRect(renderer, &bg);
+
+  SDL_Rect dst_rect = {10, 10, surf->w, surf->h};
+  SDL_RenderCopy(renderer, tex, NULL, &dst_rect);
+
+  SDL_DestroyTexture(tex);
+  SDL_FreeSurface(surf);
 }
 
 static void render_raycast(float *camera_lut, uint8_t *pixels, Camera *camera,
@@ -490,85 +514,81 @@ static void render_raycast(float *camera_lut, uint8_t *pixels, Camera *camera,
 }
 
 int main(int argc, char *argv[]) {
+  int status = EXIT_FAILURE;
+  SDL_Window *window = NULL;
+  SDL_Renderer *renderer = NULL;
+  SDL_Texture *texture = NULL;
+  uint8_t *pixels = NULL;
+  float *camera_lut = NULL;
+  TTF_Font *font = NULL;
 
   if (SDL_Init(SDL_INIT_VIDEO) != 0) {
     fprintf(stderr, "SDL_Init Error: %s\n", SDL_GetError());
-    return 1;
+    goto cleanup;
   }
 
-  SDL_Window *window = SDL_CreateWindow(
-      "Test", SDL_WINDOWPOS_CENTERED_DISPLAY(0),
-      SDL_WINDOWPOS_CENTERED_DISPLAY(0), SCREEN_WIDTH, SCREEN_HEIGHT, 0);
+  if (TTF_Init() != 0) {
+    fprintf(stderr, "TTF_Init Error: %s\n", TTF_GetError());
+    goto cleanup_sdl;
+  }
+
+  font = TTF_OpenFont(FONT_PATH, FONT_SIZE);
+  if (!font) {
+    fprintf(stderr, "TTF_OpenFont Error: %s\n", TTF_GetError());
+    goto cleanup_ttf;
+  }
+
+#if FULLSCREEN_MODE
+  window = SDL_CreateWindow("Test", SDL_WINDOWPOS_CENTERED,
+                            SDL_WINDOWPOS_CENTERED, SCREEN_WIDTH, SCREEN_HEIGHT,
+                            SDL_WINDOW_FULLSCREEN_DESKTOP);
+#else
+  window =
+      SDL_CreateWindow("Test", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                       SCREEN_WIDTH, SCREEN_HEIGHT, SDL_WINDOW_RESIZABLE);
+#endif
   if (!window) {
     fprintf(stderr, "SDL_CreateWindow Error: %s\n", SDL_GetError());
-    SDL_Quit();
-    return EXIT_FAILURE;
+    goto cleanup_font;
   }
 
-  SDL_Renderer *renderer = SDL_CreateRenderer(
+  renderer = SDL_CreateRenderer(
       window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
   if (!renderer) {
     fprintf(stderr, "SDL_CreateRenderer Error: %s\n", SDL_GetError());
-    SDL_DestroyWindow(window);
-    SDL_Quit();
-    return EXIT_FAILURE;
+    goto cleanup_window;
   }
 
-  SDL_Texture *texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888,
-                                           SDL_TEXTUREACCESS_STREAMING,
-                                           SCREEN_WIDTH, SCREEN_HEIGHT);
+  texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888,
+                              SDL_TEXTUREACCESS_STREAMING, SCREEN_WIDTH,
+                              SCREEN_HEIGHT);
   if (!texture) {
     fprintf(stderr, "SDL_CreateTexture Error: %s\n", SDL_GetError());
-    SDL_DestroyRenderer(renderer);
-    SDL_DestroyWindow(window);
-    SDL_Quit();
-    return EXIT_FAILURE;
+    goto cleanup_renderer;
   }
 
-  uint8_t *pixels = malloc(SCREEN_WIDTH * SCREEN_HEIGHT * 4);
+  pixels = malloc(SCREEN_WIDTH * SCREEN_HEIGHT * 4);
   if (!pixels) {
     fprintf(stderr, "Memory allocation failed for pixels\n");
-    SDL_DestroyTexture(texture);
-    SDL_DestroyRenderer(renderer);
-    SDL_DestroyWindow(window);
-    SDL_Quit();
-    return EXIT_FAILURE;
+    goto cleanup_texture;
   }
 
-  float *camera_lut = generate_camera_lut();
+  camera_lut = generate_camera_lut();
   if (!camera_lut) {
     fprintf(stderr, "Memory allocation failed for camera LUT\n");
-    free(pixels);
-    SDL_DestroyTexture(texture);
-    SDL_DestroyRenderer(renderer);
-    SDL_DestroyWindow(window);
-    SDL_Quit();
-    return EXIT_FAILURE;
+    goto cleanup_pixels;
   }
 
   load_tiles(TILE_MANIFEST);
   if (!tile_registry || tile_count == 0) {
     fprintf(stderr, "Failed to load tiles from manifest: %s\n", TILE_MANIFEST);
-    free(camera_lut);
-    free(pixels);
-    SDL_DestroyTexture(texture);
-    SDL_DestroyRenderer(renderer);
-    SDL_DestroyWindow(window);
-    SDL_Quit();
-    return EXIT_FAILURE;
+    goto cleanup_camera_lut;
   }
 
   struct Map map = load_map(MAP_FILE);
   if (!map.tiles) {
     fprintf(stderr, "Memory allocation failed for map tiles\n");
-    free(tile_registry);
-    free(camera_lut);
-    free(pixels);
-    SDL_DestroyTexture(texture);
-    SDL_DestroyRenderer(renderer);
-    SDL_DestroyWindow(window);
-    SDL_Quit();
-    return EXIT_FAILURE;
+    goto cleanup_tiles;
   }
 
   Camera camera = {
@@ -602,6 +622,7 @@ int main(int argc, char *argv[]) {
     Uint64 now = SDL_GetPerformanceCounter();
     float dt = (float)(now - last) / (float)freq;
     last = now;
+    float fps = 1.0f / dt;
     float move_speed = MOVE_SPEED_SEC * dt;
     float rot_speed = ROT_SPEED_SEC * dt;
 
@@ -628,16 +649,33 @@ int main(int argc, char *argv[]) {
     SDL_UpdateTexture(texture, NULL, pixels, STRIDE);
     SDL_RenderClear(renderer);
     SDL_RenderCopy(renderer, texture, NULL, NULL);
+
+    render_fps(renderer, font, fps);
+
     SDL_RenderPresent(renderer);
   }
 
+  status = EXIT_SUCCESS;
+
   free(map.tiles);
+cleanup_tiles:
   free_tile_registry();
+cleanup_camera_lut:
   free(camera_lut);
+cleanup_pixels:
   free(pixels);
+cleanup_renderer:
   SDL_DestroyRenderer(renderer);
+cleanup_texture:
   SDL_DestroyTexture(texture);
+cleanup_window:
   SDL_DestroyWindow(window);
+cleanup_font:
+  TTF_CloseFont(font);
+cleanup_ttf:
+  TTF_Quit();
+cleanup_sdl:
   SDL_Quit();
-  return 0;
+cleanup:
+  return status;
 }

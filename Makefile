@@ -8,6 +8,10 @@ LDFLAGS := $(shell sdl2-config --libs)
 CFLAGS += $(shell pkg-config --cflags SDL2_image)
 LDFLAGS += $(shell pkg-config --libs SDL2_image)
 
+# SDL2_ttf
+CFLAGS += $(shell pkg-config --cflags SDL2_ttf)
+LDFLAGS += $(shell pkg-config --libs SDL2_ttf)
+
 # Compiler optimizations
 CFLAGS += -O3 -march=native -ffast-math -funroll-loops
 
