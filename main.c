@@ -11,8 +11,8 @@
 
 #define DEBUG 1
 
-#define SCREEN_WIDTH 800
-#define SCREEN_HEIGHT 600
+#define SCREEN_WIDTH 1200
+#define SCREEN_HEIGHT 800
 #define STRIDE SCREEN_WIDTH * 4
 
 #define CAMERA_RADIUS 0.1f
@@ -28,6 +28,7 @@
 
 #define TILE_MANIFEST "tiles.txt"
 #define TILE_BASE_SIZE 128
+#define MAX_TILE_ID 0xFF
 
 #define CEILING_TILE_ID 0x41
 
@@ -59,6 +60,7 @@ typedef struct {
 } Tile;
 static Tile **tile_registry = NULL;
 static size_t tile_count = 0;
+static Tile *id_lut[MAX_TILE_ID + 1] = {NULL}; // Ensures O(1) access
 
 void load_tiles(const char *manifest_path) {
   FILE *f = fopen(manifest_path, "r");
@@ -127,6 +129,9 @@ void load_tiles(const char *manifest_path) {
     SDL_FreeSurface(s);
 
     tile_registry[idx++] = t;
+
+    if (id < MAX_TILE_ID)
+      id_lut[id] = t;
   }
 
 #ifdef DEBUG
@@ -139,15 +144,11 @@ void load_tiles(const char *manifest_path) {
   fclose(f);
 }
 
-Tile *get_tile_by_id(unsigned id) {
-  for (size_t i = 0; i < tile_count; i++) {
-    if (tile_registry[i]->id == id)
-      return tile_registry[i];
-  }
-  return NULL;
+static inline Tile *get_tile_by_id(unsigned id) {
+  return (id <= MAX_TILE_ID) ? id_lut[id] : NULL;
 }
 
-void free_tiles() {
+void free_tile_registry() {
   for (size_t i = 0; i < tile_count; i++) {
     free(tile_registry[i]->pixels);
     free(tile_registry[i]);
@@ -160,7 +161,7 @@ void free_tiles() {
 struct Map {
   size_t width;
   size_t height;
-  unsigned *tiles;
+  Tile **tiles;
 };
 
 static struct Map load_map(const char *filename) {
@@ -188,8 +189,8 @@ static struct Map load_map(const char *filename) {
 
   for (size_t y = 0; y < map.height; y++) {
     for (size_t x = 0; x < map.width; x++) {
-      int t;
-      if (fscanf(file, "%x", &t) != 1) {
+      unsigned hex;
+      if (fscanf(file, "%x", &hex) != 1) {
         fprintf(stderr, "Premature end of map data at (%zu, %zu)\n", x, y);
         free(map.tiles);
         map.tiles = NULL;
@@ -197,30 +198,29 @@ static struct Map load_map(const char *filename) {
         fclose(file);
         return map;
       }
-      map.tiles[y * map.width + x] = t;
+      map.tiles[y * map.width + x] = get_tile_by_id(hex);
     }
   }
 
   fclose(file);
+
+#ifdef DEBUG
+  if (map.tiles == NULL)
+    fprintf(stderr, "Failed to load map tiles from file: %s\n", filename);
+#endif
+
   return map;
 }
 
-static inline int get_tile(const struct Map *map, int x, int y) {
-  if (!map->tiles)
-    return -1;
-  if (x < 0 || y < 0)
-    return -1;
-  if ((size_t)x >= map->width || (size_t)y >= map->height)
-    return -1;
-  return map->tiles[y * map->width + x];
+static inline Tile *get_tile(const struct Map *m, int x, int y) {
+  if ((unsigned)x >= m->width || (unsigned)y >= m->height)
+    return NULL;
+  return m->tiles[y * m->width + x];
 }
 
-static int is_solid(const struct Map *map, int x, int y) {
-  unsigned id = get_tile(map, x, y);
-  if (id == (unsigned)-1)
-    return 1;
-  Tile *t = get_tile_by_id(id);
-  return t && t->type == TILE_TYPE_WALL;
+static inline int is_solid(const struct Map *map, int x, int y) {
+  Tile *t = get_tile(map, x, y);
+  return !t || t->type == TILE_TYPE_WALL;
 }
 
 typedef struct {
@@ -369,8 +369,7 @@ static void render_raycast(float *camera_lut, uint8_t *pixels, Camera *camera,
       floor_x += step_x;
       floor_y += step_y;
 
-      unsigned id = get_tile(map, map_x, map_y);
-      Tile *floor_tile = get_tile_by_id(id);
+      Tile *floor_tile = get_tile(map, map_x, map_y);
       if (!floor_tile || floor_tile->type != TILE_TYPE_FLOOR) {
         continue;
       }
@@ -440,8 +439,7 @@ static void render_raycast(float *camera_lut, uint8_t *pixels, Camera *camera,
         hit_side = 1;
       }
 
-      unsigned id = get_tile(map, map_x, map_y);
-      hit_tile = get_tile_by_id(id);
+      hit_tile = get_tile(map, map_x, map_y);
       if (hit_tile && hit_tile->type == TILE_TYPE_WALL) {
         break;
       }
@@ -548,9 +546,9 @@ int main(int argc, char *argv[]) {
     return EXIT_FAILURE;
   }
 
-  struct Map map = load_map(MAP_FILE);
-  if (!map.tiles) {
-    fprintf(stderr, "Memory allocation failed for map tiles\n");
+  load_tiles(TILE_MANIFEST);
+  if (!tile_registry || tile_count == 0) {
+    fprintf(stderr, "Failed to load tiles from manifest: %s\n", TILE_MANIFEST);
     free(camera_lut);
     free(pixels);
     SDL_DestroyTexture(texture);
@@ -560,10 +558,10 @@ int main(int argc, char *argv[]) {
     return EXIT_FAILURE;
   }
 
-  load_tiles(TILE_MANIFEST);
-  if (!tile_registry || tile_count == 0) {
-    fprintf(stderr, "Failed to load tiles from manifest: %s\n", TILE_MANIFEST);
-    free(map.tiles);
+  struct Map map = load_map(MAP_FILE);
+  if (!map.tiles) {
+    fprintf(stderr, "Memory allocation failed for map tiles\n");
+    free(tile_registry);
     free(camera_lut);
     free(pixels);
     SDL_DestroyTexture(texture);
@@ -633,8 +631,8 @@ int main(int argc, char *argv[]) {
     SDL_RenderPresent(renderer);
   }
 
-  free_tiles();
   free(map.tiles);
+  free_tile_registry();
   free(camera_lut);
   free(pixels);
   SDL_DestroyRenderer(renderer);
