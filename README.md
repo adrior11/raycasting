@@ -45,9 +45,11 @@ $ sudo pacman -S sdl2 sdl2_image sdl2_ttf
 ```
 
 ## 🎨 Assets Setup
-Assets like textures (under `textures/...`) and the font file (under `fonts/...`) are git‑ignored due to licensing. You must provide your own:
+>[!Important]
+>Assets like textures (under `textures/...`) and the font file (under `fonts/...`) are git‑ignored due to licensing.
+>You must provide your own in order to run the application:
 
-1. **Textures:** Create a `textures/` directory in the repo root, then add subfolders matching the paths in `tiles.txt`.
+1. **Textures:** Create a `textures/` directory in the repo root, then add subfolders matching the paths in your `tiles.txt`.
 Example:
 ```
 raycasting/
