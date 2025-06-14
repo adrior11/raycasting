@@ -4,6 +4,7 @@
 #include <SDL_image.h>
 #include <math.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,6 +28,8 @@
 
 #define TILE_MANIFEST "tiles.txt"
 #define TILE_BASE_SIZE 128
+
+#define CEILING_TILE_ID 0x41
 
 static const float MOVE_SPEED_SEC = 5.0f;
 static const float ROT_SPEED_SEC = 5.0f;
@@ -186,7 +189,7 @@ static struct Map load_map(const char *filename) {
   for (size_t y = 0; y < map.height; y++) {
     for (size_t x = 0; x < map.width; x++) {
       int t;
-      if (fscanf(file, "%d", &t) != 1) {
+      if (fscanf(file, "%x", &t) != 1) {
         fprintf(stderr, "Premature end of map data at (%zu, %zu)\n", x, y);
         free(map.tiles);
         map.tiles = NULL;
@@ -338,6 +341,62 @@ static void vertical_line(uint8_t *pixels, int x, int y0, int y1,
 
 static void render_raycast(float *camera_lut, uint8_t *pixels, Camera *camera,
                            const struct Map *map) {
+
+  // FLOOR & CEILING RENDERING
+  for (int y = SCREEN_HEIGHT / 2; y < SCREEN_HEIGHT; y++) {
+    float p = (float)(y - SCREEN_HEIGHT / 2.0f);
+    float camera_z = 0.5f * SCREEN_HEIGHT;
+    float row_dist = camera_z / p;
+
+    float ray_dir_x0 = camera->dir_x - camera->plane_x;
+    float ray_dir_y0 = camera->dir_y - camera->plane_y;
+    float ray_dir_x1 = camera->dir_x + camera->plane_x;
+    float ray_dir_y1 = camera->dir_y + camera->plane_y;
+
+    float step_x = row_dist * (ray_dir_x1 - ray_dir_x0) / SCREEN_WIDTH;
+    float step_y = row_dist * (ray_dir_y1 - ray_dir_y0) / SCREEN_WIDTH;
+
+    float floor_x = camera->pos_x + ray_dir_x0 * row_dist;
+    float floor_y = camera->pos_y + ray_dir_y0 * row_dist;
+
+    for (int x = 0; x < SCREEN_WIDTH; x++) {
+      int map_x = (int)floorf(floor_x);
+      int map_y = (int)floorf(floor_y);
+
+      floor_x += step_x;
+      floor_y += step_y;
+
+      unsigned id = get_tile(map, map_x, map_y);
+      Tile *floor_tile = get_tile_by_id(id);
+      if (!floor_tile || floor_tile->type != TILE_TYPE_FLOOR) {
+        continue;
+      }
+
+      int tex_x = ((int)((floor_x - map_x) * floor_tile->width) &
+                   (floor_tile->width - 1));
+      int tex_y = ((int)((floor_y - map_y) * floor_tile->height) &
+                   (floor_tile->height - 1));
+
+      uint32_t floor_color =
+          floor_tile->pixels[tex_y * floor_tile->width + tex_x];
+      uint8_t *fp = pixels + (size_t)y * STRIDE + x * 4;
+      fp[0] = floor_color & 0xFF;         // B
+      fp[1] = (floor_color >> 8) & 0xFF;  // G
+      fp[2] = (floor_color >> 16) & 0xFF; // R
+      fp[3] = 0xFF;                       // A
+
+      Tile *ceil_tile = get_tile_by_id(CEILING_TILE_ID);
+      uint32_t ceil_color = ceil_tile->pixels[tex_y * ceil_tile->width + tex_x];
+      ceil_color = (ceil_color >> 1) & 8355711; // make a bit darker
+      uint8_t *cp = pixels + (size_t)(SCREEN_HEIGHT - y - 1) * STRIDE + x * 4;
+      cp[0] = ceil_color & 0xFF;         // B
+      cp[1] = (ceil_color >> 8) & 0xFF;  // G
+      cp[2] = (ceil_color >> 16) & 0xFF; // R
+      cp[3] = 0xFF;                      // A
+    }
+  }
+
+  // WALL RENDERING
   for (int x = 0; x < SCREEN_WIDTH; x++) {
     float camera_x = camera_lut[x];
 
@@ -426,9 +485,6 @@ static void render_raycast(float *camera_lut, uint8_t *pixels, Camera *camera,
       p[2] = (color >> 16) & 0xFF; // R
       p[3] = 0xFF;                 // A
     }
-
-    vertical_line(pixels, x, 0, draw_start, SKY_COLOR);
-    vertical_line(pixels, x, draw_end, SCREEN_HEIGHT, GROUND_COLOR);
   }
 }
 
