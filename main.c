@@ -8,21 +8,25 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define DEBUG 1
+
 #define SCREEN_WIDTH 800
 #define SCREEN_HEIGHT 600
-
 #define STRIDE SCREEN_WIDTH * 4
+
 #define CAMERA_RADIUS 0.1f
 #define FOV_FACTOR 0.66f
-#define MAP_FILE "map.txt"
-#define MAP_MAX_STEPS 1024
+
 #define WALL_DIM_FACTOR 0xC0u
 #define SKY_COLOR 0xFF202020u
 #define GROUND_COLOR 0xFF505050u
 #define FOG_FACTOR 0.03f
 
-#define TILE_SIZE 128
-#define TILE_COUNT 4
+#define MAP_FILE "map.txt"
+#define MAP_MAX_STEPS 1024
+
+#define TILE_MANIFEST "tiles.txt"
+#define TILE_BASE_SIZE 128
 
 static const float MOVE_SPEED_SEC = 5.0f;
 static const float ROT_SPEED_SEC = 5.0f;
@@ -36,18 +40,124 @@ static inline float clampf(float v, float lo, float hi) {
 static inline float inv_abs(float v) { return 1.0f / (fabsf(v) + 1e-20f); }
 
 typedef enum {
-  TILE_EMPTY = 0,
-  TILE_BLUE,
-  TILE_GREEN,
-  TILE_RED,
-  TILE_MAGENTA,
-  TILE_MAX
+  TILE_TYPE_EMPTY,
+  TILE_TYPE_FLOOR,
+  TILE_TYPE_WALL,
+  TILE_TYPE_DOOR,
+  TILE_TYPE_DECOR,
 } TileType;
+
+typedef struct {
+  unsigned id;
+  int width;
+  int height;
+  uint32_t *pixels;
+  TileType type;
+} Tile;
+static Tile **tile_registry = NULL;
+static size_t tile_count = 0;
+
+void load_tiles(const char *manifest_path) {
+  FILE *f = fopen(manifest_path, "r");
+  if (!f) {
+    fprintf(stderr, "Failed to open tile manifest: %s\n", manifest_path);
+    return;
+  }
+
+  unsigned id;
+  char filename[256], typestr[16];
+  while (1) {
+    int r = fscanf(f, "%x %255s %15s", &id, filename, typestr);
+    if (r != 3)
+      break;
+    tile_count++;
+  }
+
+  tile_registry = calloc(tile_count, sizeof(Tile *));
+  if (!tile_registry) {
+    fprintf(stderr, "Memory allocation failed for tile registry\n");
+    fclose(f);
+    exit(EXIT_FAILURE);
+  }
+
+  rewind(f);
+
+  size_t idx = 0;
+  while (fscanf(f, "%x %255s %15s", &id, filename, typestr) == 3) {
+    SDL_Surface *s = IMG_Load(filename);
+    if (!s) {
+      fprintf(stderr, "IMG_Load(%s): %s\n", filename, IMG_GetError());
+      SDL_FreeSurface(s);
+      exit(EXIT_FAILURE);
+    }
+
+    if (s->format->format != SDL_PIXELFORMAT_ARGB8888) {
+      SDL_Surface *conv =
+          SDL_ConvertSurfaceFormat(s, SDL_PIXELFORMAT_ARGB8888, 0);
+      SDL_FreeSurface(s);
+      s = conv;
+    }
+
+    Tile *t = malloc(sizeof(Tile));
+    if (!t) {
+      fprintf(stderr, "Memory allocation failed for tile %u\n", id);
+      SDL_FreeSurface(s);
+      exit(EXIT_FAILURE);
+    }
+
+    t->id = id;
+    t->width = s->w;
+    t->height = s->h;
+    t->pixels = malloc(t->width * t->height * sizeof(uint32_t));
+    if (!t->pixels) {
+      fprintf(stderr, "Memory allocation failed for tile pixels %u\n", id);
+      free(t);
+      SDL_FreeSurface(s);
+      exit(EXIT_FAILURE);
+    }
+    t->type = (strcmp(typestr, "floor") == 0)  ? TILE_TYPE_FLOOR
+              : (strcmp(typestr, "wall") == 0) ? TILE_TYPE_WALL
+              : (strcmp(typestr, "door") == 0) ? TILE_TYPE_DOOR
+                                               : TILE_TYPE_DECOR;
+
+    memcpy(t->pixels, s->pixels, t->width * t->height * sizeof(uint32_t));
+    SDL_FreeSurface(s);
+
+    tile_registry[idx++] = t;
+  }
+
+#ifdef DEBUG
+  if (idx != tile_count) {
+    fprintf(stderr, "Warning: Expected %zu tiles, but loaded %zu\n", tile_count,
+            idx);
+  }
+#endif
+
+  fclose(f);
+}
+
+Tile *get_tile_by_id(unsigned id) {
+  for (size_t i = 0; i < tile_count; i++) {
+    if (tile_registry[i]->id == id)
+      return tile_registry[i];
+  }
+  return NULL;
+}
+
+void free_tiles() {
+  for (size_t i = 0; i < tile_count; i++) {
+    free(tile_registry[i]->pixels);
+    free(tile_registry[i]);
+  }
+  free(tile_registry);
+  tile_registry = NULL;
+  tile_count = 0;
+}
 
 struct Map {
   size_t width;
   size_t height;
-  int *tiles;
+  unsigned *tiles;
 };
 
 static struct Map load_map(const char *filename) {
@@ -128,14 +238,17 @@ static void move_camera(Camera *camera, struct Map *map, float move_dir_x,
   float new_x = camera->pos_x + move_dir_x * move_speed;
   float new_y = camera->pos_y + move_dir_y * move_speed;
 
-  int min_tx = (int)fmaxf(floorf(new_x - 1.0f), 0.0f);
-  int max_tx = (int)fminf(ceilf(new_x + 1.0f), (float)map->width - 1.0f);
-  int min_ty = (int)fmaxf(floorf(new_y - 1.0f), 0.0f);
-  int max_ty = (int)fminf(ceilf(new_y + 1.0f), (float)map->height - 1.0f);
+  float r = CAMERA_RADIUS;
+  int min_tx = (int)floorf(new_x - r);
+  int max_tx = (int)ceilf(new_x + r);
+  int min_ty = (int)floorf(new_y - r);
+  int max_ty = (int)ceilf(new_y + r);
 
   for (int ty = min_ty; ty <= max_ty; ty++) {
     for (int tx = min_tx; tx <= max_tx; tx++) {
-      if (get_tile(map, tx, ty) == TILE_EMPTY)
+      unsigned tile_id = get_tile(map, tx, ty);
+      Tile *t = get_tile_by_id(tile_id);
+      if (!t || t->type != TILE_TYPE_WALL)
         continue;
 
       const float tile_l = (float)tx;
@@ -150,10 +263,10 @@ static void move_camera(Camera *camera, struct Map *map, float move_dir_x,
       float dy = new_y - closest_y;
       float dist_sq = dx * dx + dy * dy;
 
-      if (dist_sq < CAMERA_RADIUS * CAMERA_RADIUS) {
+      if (dist_sq < r * r) {
         float dist = sqrtf(dist_sq);
         if (dist > 0.0f) {
-          float penetration = CAMERA_RADIUS - dist;
+          float penetration = r - dist;
           new_x += dx / dist * penetration;
           new_y += dy / dist * penetration;
         }
@@ -163,46 +276,6 @@ static void move_camera(Camera *camera, struct Map *map, float move_dir_x,
 
   camera->pos_x = new_x;
   camera->pos_y = new_y;
-}
-
-static uint32_t *tile_pixels[TILE_COUNT] = {NULL};
-
-static void load_tiles(void) {
-  IMG_Init(IMG_INIT_PNG);
-
-  const char *filenames[TILE_COUNT] = {
-      "textures/wall/walltextures.png",
-      "textures/wall/walltextures0.png",
-      "textures/wall/walltextures1.png",
-      "textures/wall/walltextures2.png",
-  };
-
-  for (int i = 0; i < TILE_COUNT; i++) {
-    SDL_Surface *s = IMG_Load(filenames[i]);
-    if (!s) {
-      fprintf(stderr, "IMG_Load(%s): %s\n", filenames[i], IMG_GetError());
-      exit(EXIT_FAILURE);
-    }
-
-    if (s->format->format != SDL_PIXELFORMAT_ARGB8888) {
-      SDL_Surface *conv =
-          SDL_ConvertSurfaceFormat(s, SDL_PIXELFORMAT_ARGB8888, 0);
-      SDL_FreeSurface(s);
-      s = conv;
-    }
-
-    // NOTE: This assumes the surface is at least TILE_SIZE x TILE_SIZE
-    tile_pixels[i] = malloc(TILE_SIZE * TILE_SIZE * sizeof(uint32_t));
-    memcpy(tile_pixels[i], s->pixels, TILE_SIZE * TILE_SIZE * sizeof(uint32_t));
-    SDL_FreeSurface(s);
-  };
-}
-
-static inline void free_tiles(void) {
-  for (int i = 0; i < TILE_COUNT; i++) {
-    free(tile_pixels[i]);
-    tile_pixels[i] = NULL;
-  }
 }
 
 static inline unsigned int dim_color(unsigned int color, unsigned int factor) {
@@ -274,66 +347,65 @@ static void render_raycast(float *camera_lut, uint8_t *pixels, Camera *camera,
     float ray_pos_x = camera->pos_x;
     float ray_pos_y = camera->pos_y;
 
-    int ipos_x = (int)ray_pos_x;
-    int ipos_y = (int)ray_pos_y;
+    int map_x = (int)ray_pos_x;
+    int map_y = (int)ray_pos_y;
 
+    // length of ray from one x or y-side to next x or y-side
     float delta_dist_x = inv_abs(ray_dir_x);
     float delta_dist_y = inv_abs(ray_dir_y);
 
     int step_x = sgnf(ray_dir_x);
     int step_y = sgnf(ray_dir_y);
 
+    // length of ray from current position to next x or y-side
     float side_dist_x = (ray_dir_x < 0)
-                            ? (ray_pos_x - ipos_x) * delta_dist_x
-                            : (ipos_x + 1.0f - ray_pos_x) * delta_dist_x;
+                            ? (ray_pos_x - map_x) * delta_dist_x
+                            : (map_x + 1.0f - ray_pos_x) * delta_dist_x;
     float side_dist_y = (ray_dir_y < 0)
-                            ? (ray_pos_y - ipos_y) * delta_dist_y
-                            : (ipos_y + 1.0f - ray_pos_y) * delta_dist_y;
+                            ? (ray_pos_y - map_y) * delta_dist_y
+                            : (map_y + 1.0f - ray_pos_y) * delta_dist_y;
 
-    int hit_val = TILE_EMPTY;
+    Tile *hit_tile = NULL;
     int hit_side = 0;
-    int steps = 0;
-
-    while (hit_val == TILE_EMPTY && steps < MAP_MAX_STEPS) {
+    for (int steps = 0; steps < MAP_MAX_STEPS; steps++) {
       if (side_dist_x < side_dist_y) {
         side_dist_x += delta_dist_x;
-        ipos_x += step_x;
+        map_x += step_x;
         hit_side = 0;
       } else {
         side_dist_y += delta_dist_y;
-        ipos_y += step_y;
+        map_y += step_y;
         hit_side = 1;
       }
 
-      hit_val = get_tile(map, ipos_x, ipos_y);
-      if (hit_val == -1)
+      unsigned id = get_tile(map, map_x, map_y);
+      hit_tile = get_tile_by_id(id);
+      if (hit_tile && hit_tile->type == TILE_TYPE_WALL) {
         break;
+      }
 
-      steps++;
+      // continue searching
+      hit_tile = NULL;
     }
 
-    if (hit_val < 0 || hit_val >= TILE_MAX)
-      hit_val = TILE_EMPTY;
+    if (!hit_tile) {
+      vertical_line(pixels, x, 0, SCREEN_HEIGHT - 1, SKY_COLOR);
+      continue;
+    }
 
+    // calculate the perpendicular distance to the wall
     float perp_wall_dist = (hit_side == 0) ? side_dist_x - delta_dist_x
                                            : side_dist_y - delta_dist_y;
     if (perp_wall_dist < 1e-6f)
       perp_wall_dist = 1e-6f;
 
-    int tex_id = maxi(0, hit_val - 1);
-
-    if (tex_id >= TILE_COUNT) {
-      fprintf(stderr, "Invalid texture ID: %d\n", tex_id);
-      tex_id = 0;
-    }
-
     float wall_x = (hit_side == 0) ? (ray_pos_y + perp_wall_dist * ray_dir_y)
                                    : (ray_pos_x + perp_wall_dist * ray_dir_x);
     wall_x -= floorf(wall_x);
 
-    int tex_x = (int)(wall_x * TILE_SIZE);
+    int tex_x = (int)(wall_x * hit_tile->width) & (hit_tile->width - 1);
     if ((hit_side == 0 && ray_dir_x > 0) || (hit_side == 1 && ray_dir_y < 0)) {
-      tex_x = TILE_SIZE - tex_x - 1;
+      tex_x = hit_tile->width - 1 - tex_x;
     }
 
     int line_height = (int)(SCREEN_HEIGHT / perp_wall_dist);
@@ -342,18 +414,17 @@ static void render_raycast(float *camera_lut, uint8_t *pixels, Camera *camera,
 
     for (int y = draw_start; y <= draw_end; y++) {
       int d = y * 256 - SCREEN_HEIGHT * 128 + line_height * 128;
-      int tex_y = ((d * TILE_SIZE) / line_height) / 256;
+      int tex_y = ((d * hit_tile->height) / line_height) / 256;
 
-      uint32_t c = tile_pixels[tex_id][tex_y * TILE_SIZE + tex_x];
-
+      uint32_t color = hit_tile->pixels[tex_y * hit_tile->width + tex_x];
       if (hit_side)
-        c = dim_color(c, WALL_DIM_FACTOR);
+        color = dim_color(color, WALL_DIM_FACTOR);
 
       uint8_t *p = pixels + (size_t)y * STRIDE + x * 4;
-      p[0] = c & 0xFF;         // B
-      p[1] = (c >> 8) & 0xFF;  // G
-      p[2] = (c >> 16) & 0xFF; // R
-      p[3] = 0xFF;             // A
+      p[0] = color & 0xFF;         // B
+      p[1] = (color >> 8) & 0xFF;  // G
+      p[2] = (color >> 16) & 0xFF; // R
+      p[3] = 0xFF;                 // A
     }
 
     vertical_line(pixels, x, 0, draw_start, SKY_COLOR);
@@ -430,7 +501,18 @@ int main(int argc, char *argv[]) {
     return EXIT_FAILURE;
   }
 
-  load_tiles();
+  load_tiles(TILE_MANIFEST);
+  if (!tile_registry || tile_count == 0) {
+    fprintf(stderr, "Failed to load tiles from manifest: %s\n", TILE_MANIFEST);
+    free(map.tiles);
+    free(camera_lut);
+    free(pixels);
+    SDL_DestroyTexture(texture);
+    SDL_DestroyRenderer(renderer);
+    SDL_DestroyWindow(window);
+    SDL_Quit();
+    return EXIT_FAILURE;
+  }
 
   Camera camera = {
       .pos_x = 2.0f,
