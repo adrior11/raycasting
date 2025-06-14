@@ -10,6 +10,7 @@
 
 #define SCREEN_WIDTH 800
 #define SCREEN_HEIGHT 600
+
 #define STRIDE SCREEN_WIDTH * 4
 #define CAMERA_RADIUS 0.1f
 #define FOV_FACTOR 0.66f
@@ -20,11 +21,8 @@
 #define GROUND_COLOR 0xFF505050u
 #define FOG_FACTOR 0.03f
 
-#define TEX_W 16
-#define TEX_H 16
-#define TEX_COUNT 4
-#define ATLAS_W (TEX_W * TEX_COUNT)
-#define ATLAS_H TEX_H
+#define TILE_SIZE 128
+#define TILE_COUNT 4
 
 static const float MOVE_SPEED_SEC = 5.0f;
 static const float ROT_SPEED_SEC = 5.0f;
@@ -167,32 +165,44 @@ static void move_camera(Camera *camera, struct Map *map, float move_dir_x,
   camera->pos_y = new_y;
 }
 
-static uint32_t *atlas_pixels = NULL;
-static void load_atlas(const char *png) {
+static uint32_t *tile_pixels[TILE_COUNT] = {NULL};
+
+static void load_tiles(void) {
   IMG_Init(IMG_INIT_PNG);
 
-  SDL_Surface *s = IMG_Load(png);
-  if (!s) {
-    fprintf(stderr, "Failed to load texture atlas: %s\n", IMG_GetError());
-    exit(EXIT_FAILURE);
-  }
+  const char *filenames[TILE_COUNT] = {
+      "textures/wall/walltextures.png",
+      "textures/wall/walltextures0.png",
+      "textures/wall/walltextures1.png",
+      "textures/wall/walltextures2.png",
+  };
 
-  if (s->format->format != SDL_PIXELFORMAT_ARGB8888) {
-    SDL_Surface *conv =
-        SDL_ConvertSurfaceFormat(s, SDL_PIXELFORMAT_ARGB8888, 0);
+  for (int i = 0; i < TILE_COUNT; i++) {
+    SDL_Surface *s = IMG_Load(filenames[i]);
+    if (!s) {
+      fprintf(stderr, "IMG_Load(%s): %s\n", filenames[i], IMG_GetError());
+      exit(EXIT_FAILURE);
+    }
+
+    if (s->format->format != SDL_PIXELFORMAT_ARGB8888) {
+      SDL_Surface *conv =
+          SDL_ConvertSurfaceFormat(s, SDL_PIXELFORMAT_ARGB8888, 0);
+      SDL_FreeSurface(s);
+      s = conv;
+    }
+
+    // NOTE: This assumes the surface is at least TILE_SIZE x TILE_SIZE
+    tile_pixels[i] = malloc(TILE_SIZE * TILE_SIZE * sizeof(uint32_t));
+    memcpy(tile_pixels[i], s->pixels, TILE_SIZE * TILE_SIZE * sizeof(uint32_t));
     SDL_FreeSurface(s);
-    s = conv;
-  }
-
-  atlas_pixels = malloc(ATLAS_W * ATLAS_H * sizeof(uint32_t));
-  memcpy(atlas_pixels, s->pixels, ATLAS_W * ATLAS_H * sizeof(uint32_t));
-  SDL_FreeSurface(s);
+  };
 }
 
-static char *get_texture_path(const char *name) {
-  static char path[256];
-  snprintf(path, sizeof(path), "textures/%s.png", name);
-  return path;
+static inline void free_tiles(void) {
+  for (int i = 0; i < TILE_COUNT; i++) {
+    free(tile_pixels[i]);
+    tile_pixels[i] = NULL;
+  }
 }
 
 static inline unsigned int dim_color(unsigned int color, unsigned int factor) {
@@ -312,7 +322,7 @@ static void render_raycast(float *camera_lut, uint8_t *pixels, Camera *camera,
 
     int tex_id = maxi(0, hit_val - 1);
 
-    if (tex_id >= TEX_COUNT) {
+    if (tex_id >= TILE_COUNT) {
       fprintf(stderr, "Invalid texture ID: %d\n", tex_id);
       tex_id = 0;
     }
@@ -321,13 +331,10 @@ static void render_raycast(float *camera_lut, uint8_t *pixels, Camera *camera,
                                    : (ray_pos_x + perp_wall_dist * ray_dir_x);
     wall_x -= floorf(wall_x);
 
-    int tex_x = (int)(wall_x * TEX_W);
+    int tex_x = (int)(wall_x * TILE_SIZE);
     if ((hit_side == 0 && ray_dir_x > 0) || (hit_side == 1 && ray_dir_y < 0)) {
-      tex_x = TEX_W - tex_x - 1;
+      tex_x = TILE_SIZE - tex_x - 1;
     }
-
-    // Horizontal offset of this tile inside the 64-pixel atlas row
-    int atlas_x0 = tex_id * TEX_W;
 
     int line_height = (int)(SCREEN_HEIGHT / perp_wall_dist);
     int draw_start = maxi(0, (SCREEN_HEIGHT - line_height) / 2);
@@ -335,9 +342,9 @@ static void render_raycast(float *camera_lut, uint8_t *pixels, Camera *camera,
 
     for (int y = draw_start; y <= draw_end; y++) {
       int d = y * 256 - SCREEN_HEIGHT * 128 + line_height * 128;
-      int tex_y = ((d * TEX_H) / line_height) / 256; // 0..15
+      int tex_y = ((d * TILE_SIZE) / line_height) / 256;
 
-      uint32_t c = atlas_pixels[(tex_y * ATLAS_W) + atlas_x0 + tex_x];
+      uint32_t c = tile_pixels[tex_id][tex_y * TILE_SIZE + tex_x];
 
       if (hit_side)
         c = dim_color(c, WALL_DIM_FACTOR);
@@ -423,8 +430,7 @@ int main(int argc, char *argv[]) {
     return EXIT_FAILURE;
   }
 
-  char *atlas_path = get_texture_path("atlas");
-  load_atlas(atlas_path);
+  load_tiles();
 
   Camera camera = {
       .pos_x = 2.0f,
@@ -486,7 +492,7 @@ int main(int argc, char *argv[]) {
     SDL_RenderPresent(renderer);
   }
 
-  free(atlas_pixels);
+  free_tiles();
   free(map.tiles);
   free(camera_lut);
   free(pixels);

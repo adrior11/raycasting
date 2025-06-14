@@ -40,3 +40,6 @@ cscope.*
 
 # Logs and temp files
 *.log
+
+# Textures
+textures/
